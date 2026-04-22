@@ -86,7 +86,7 @@ sanity-test: azurefile
 
 .PHONY: e2e-test
 e2e-test:
-	if [ ! -z "$(EXTERNAL_E2E_TEST_SMB)" ] || [ ! -z "$(EXTERNAL_E2E_TEST_NFS)" ]; then \
+	if [ ! -z "$(EXTERNAL_E2E_TEST_SMB)" ] || [ ! -z "$(EXTERNAL_E2E_TEST_NFS)" ] || [ ! -z "$(EXTERNAL_E2E_TEST_PV2)" ]; then \
 		bash ./test/external-e2e/run.sh;\
 	else \
 		bash ./hack/parse-prow-creds.sh;\

@@ -25,13 +25,15 @@ install_ginkgo () {
 
 setup_e2e_binaries() {
     # download k8s external e2e binary for kubernetes
-    curl -sL https://dl.k8s.io/release/v1.26.0/kubernetes-test-linux-amd64.tar.gz --output e2e-tests.tar.gz
+    curl -sL https://dl.k8s.io/release/v1.35.4/kubernetes-test-linux-amd64.tar.gz --output e2e-tests.tar.gz
     tar -xvf e2e-tests.tar.gz && rm e2e-tests.tar.gz
 
     # test on alternative driver name
     export EXTRA_HELM_OPTIONS=" --set driver.name=$DRIVER.csi.azure.com --set controller.name=csi-$DRIVER-controller --set linux.dsName=csi-$DRIVER-node --set windows.dsName=csi-$DRIVER-node-win"
     sed -i "s/file.csi.azure.com/$DRIVER.csi.azure.com/g" deploy/example/storageclass-azurefile-csi.yaml
     sed -i "s/file.csi.azure.com/$DRIVER.csi.azure.com/g" deploy/example/storageclass-azurefile-nfs.yaml
+    sed -i "s/file.csi.azure.com/$DRIVER.csi.azure.com/g" deploy/example/storageclass-azurefile-pv2.yaml
+    sed -i "s/file.csi.azure.com/$DRIVER.csi.azure.com/g" deploy/example/modifyvolume/volumeattributesclass.yaml
     # run e2e test on standard storage class since premium file share only supports volume size >= 100GiB
     sed -i "s/Premium/Standard/g" deploy/example/storageclass-azurefile-csi.yaml
     make e2e-bootstrap
@@ -66,5 +68,15 @@ if [ ! -z ${EXTERNAL_E2E_TEST_NFS} ]; then
 	ginkgo -p --progress --v -focus="External.Storage.*$DRIVER.csi.azure.com" \
 		-skip='\[Disruptive\]|should provision storage with any volume data source|should mount multiple PV pointing to the same storage on the same node|pod created with an initial fsgroup, volume contents ownership changed via chgrp in first pod, new pod with same fsgroup applied to the volume contents' kubernetes/test/bin/e2e.test  -- \
 		-storage.testdriver=$PROJECT_ROOT/test/external-e2e/testdriver-nfs.yaml \
+		--kubeconfig=$KUBECONFIG
+fi
+
+if [ ! -z ${EXTERNAL_E2E_TEST_PV2} ]; then
+	echo "begin to run PV2 tests ...."
+	cp deploy/example/storageclass-azurefile-pv2.yaml /tmp/csi/storageclass-pv2.yaml
+	cp deploy/example/modifyvolume/volumeattributesclass.yaml /tmp/csi/vac-pv2.yaml
+	ginkgo -p --progress --v -focus="External.Storage.*$DRIVER.csi.azure.com" \
+		-skip='\[Disruptive\]|should provision storage with any volume data source|should mount multiple PV pointing to the same storage on the same node|pod created with an initial fsgroup, volume contents ownership changed via chgrp in first pod, new pod with same fsgroup applied to the volume contents' kubernetes/test/bin/e2e.test  -- \
+		-storage.testdriver=$PROJECT_ROOT/test/external-e2e/testdriver-pv2.yaml \
 		--kubeconfig=$KUBECONFIG
 fi

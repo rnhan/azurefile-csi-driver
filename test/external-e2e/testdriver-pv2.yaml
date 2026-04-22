@@ -1,0 +1,24 @@
+# Manifest for Kubernetes external tests (PV2 with VolumeAttributesClass).
+# See https://github.com/kubernetes/kubernetes/tree/master/test/e2e/storage/external
+
+StorageClass:
+  FromFile: /tmp/csi/storageclass-pv2.yaml
+VolumeAttributesClass:
+  FromFile: /tmp/csi/vac-pv2.yaml
+DriverInfo:
+  Name: test.csi.azure.com
+  Capabilities:
+    persistence: true
+    exec: true
+    multipods: true
+    RWX: true
+    fsGroup: true
+    topology: false
+    controllerExpansion: true
+    nodeExpansion: true
+    offlineExpansion: true
+    onlineExpansion: true
+    volumeLimits: false
+    volumeMountGroup: true
+  SupportedSizeRange:
+    Min: 100Gi
