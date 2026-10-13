@@ -18,6 +18,8 @@ package azurefile
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -581,7 +583,7 @@ func getDefaultBandwidth(requestGiB int, storageAccountType string) *int32 {
 	return &bandwidth
 }
 
-func setCredentialCache(server, clientID, tenantID, tokenFile, token, authorityHost, resource string) ([]byte, error) {
+func setCredentialCache(server, clientID, tenantID, tokenFile, token, authorityHost, resource string, cacheUID uint32) ([]byte, error) {
 	if server == "" {
 		return nil, fmt.Errorf("server must be provided")
 	}
@@ -617,6 +619,11 @@ func setCredentialCache(server, clientID, tenantID, tokenFile, token, authorityH
 		args = []string{"set", serverURL, "--imds-client-id", clientID}
 	}
 
+	// Pin the credential cache to a per-identity uid so every identity on the
+	// node writes its own krb5cc_<uid>, same uid as cruid= in the CIFS mount
+	// options, so the kernel reconnect upcall uses correct identity.
+	args = append(args, "--cache-uid", strconv.FormatUint(uint64(cacheUID), 10))
+
 	cmd := exec.Command("azfilesauthmanager", args...)
 	cmd.Env = append(os.Environ(), cmd.Env...)
 	if token != "" {
@@ -625,6 +632,54 @@ func setCredentialCache(server, clientID, tenantID, tokenFile, token, authorityH
 		klog.V(2).Infof("Executing command: %q", cmd.String())
 	}
 	return cmd.CombinedOutput()
+}
+
+// Per-identity Kerberos credential-cache uids live in a high, otherwise-unused
+// band, never provisioned as real OS accounts, used only as the suffix of the
+// per-identity credential cache file (/var/lib/kubelet/kerberos/krb5cc_<uid>)
+// and cruid= value in the CIFS mount options, for kernel's reconnect upcall to
+// find the right identity's ticket.
+const (
+	derivedCruidBase = 2000000
+	derivedCruidSpan = 1000000000
+)
+
+// deriveCruid maps a per-identity key (client ID, or an OAuth token subject) to
+// a uid via cryptographic digest. The mapping is stateless so it is identical
+// across driver restarts and across the lifetime of a mount.
+func deriveCruid(identityKey string) uint32 {
+	sum := sha256.Sum256([]byte(identityKey))
+	v := binary.BigEndian.Uint64(sum[:8])
+	return uint32(derivedCruidBase + (v % derivedCruidSpan))
+}
+
+// getExplicitCruid returns an operator-supplied cruid= found in mountFlags.
+func getExplicitCruid(mountFlags []string) (uint32, bool) {
+	for _, f := range mountFlags {
+		for _, kv := range strings.Split(f, ",") {
+			kv = strings.TrimSpace(kv)
+			if v, ok := strings.CutPrefix(kv, "cruid="); ok {
+				if uid, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32); err == nil {
+					return uint32(uid), true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// resolveCruid picks the per-identity cruid for a mount: an explicit operator
+// override from mountFlags if present, otherwise a value derived from the
+// identity key. An empty identityKey with no override falls back to 0, which
+// preserves the legacy shared-cache behavior.
+func resolveCruid(mountFlags []string, identityKey string) uint32 {
+	if uid, ok := getExplicitCruid(mountFlags); ok {
+		return uid
+	}
+	if identityKey == "" {
+		return 0
+	}
+	return deriveCruid(identityKey)
 }
 
 // invalidFolderNameChars contains characters not allowed in Azure file share folder names

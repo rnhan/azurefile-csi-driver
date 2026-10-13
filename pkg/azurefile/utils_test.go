@@ -18,6 +18,8 @@ package azurefile
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1776,7 +1778,7 @@ func TestSetCredentialCache(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		_, err := setCredentialCache(test.server, test.clientID, test.tenantID, test.tokenFile, "", defaultActiveDirectoryEndpoint, defaultStorageResource)
+		_, err := setCredentialCache(test.server, test.clientID, test.tenantID, test.tokenFile, "", defaultActiveDirectoryEndpoint, defaultStorageResource, 0)
 		if test.expectedError != "" {
 			if err == nil {
 				t.Errorf("test[%s]: expected error containing %q, got nil", test.desc, test.expectedError)
@@ -1818,7 +1820,7 @@ func TestSetCredentialCache(t *testing.T) {
 	}
 
 	for _, test := range tokenTests {
-		_, err := setCredentialCache(test.server, "", "", test.tokenFile, test.token, "", "")
+		_, err := setCredentialCache(test.server, "", "", test.tokenFile, test.token, "", "", 0)
 		if test.expectedError != "" {
 			if err == nil {
 				t.Errorf("test[%s]: expected error containing %q, got nil", test.desc, test.expectedError)
@@ -1993,6 +1995,96 @@ func TestValidateSMBCredentialValues(t *testing.T) {
 			err := validateSMBCredentialValues(tc.accountName, tc.accountKey)
 			if (err != nil) != tc.expectErr {
 				t.Errorf("validateSMBCredentialValues(%q, <key>) error = %v, expectErr %v", tc.accountName, err, tc.expectErr)
+			}
+		})
+	}
+}
+
+func TestDeriveCruid(t *testing.T) {
+	const clientA = "11111111-1111-1111-1111-111111111111"
+	const clientB = "22222222-2222-2222-2222-222222222222"
+
+	a1 := deriveCruid(clientA)
+	a2 := deriveCruid(clientA)
+	if a1 != a2 {
+		t.Fatalf("deriveCruid not deterministic: %d != %d", a1, a2)
+	}
+	if b := deriveCruid(clientB); b == a1 {
+		t.Fatalf("deriveCruid collided for distinct identities: %d", b)
+	}
+	// uid must live in the reserved high band, never aliasing real/system uids.
+	if a1 < derivedCruidBase || a1 >= derivedCruidBase+derivedCruidSpan {
+		t.Fatalf("deriveCruid %d out of band [%d,%d)", a1, derivedCruidBase, derivedCruidBase+derivedCruidSpan)
+	}
+}
+
+func TestGetExplicitCruid(t *testing.T) {
+	tests := []struct {
+		name  string
+		flags []string
+		want  uint32
+		ok    bool
+	}{
+		{"none", []string{"dir_mode=0777", "vers=3.0"}, 0, false},
+		{"single", []string{"cruid=4242"}, 4242, true},
+		{"within-csv", []string{"sec=krb5,cruid=99,upcall_target=mount"}, 99, true},
+		{"spaces", []string{" cruid=7 "}, 7, true},
+		{"invalid", []string{"cruid=abc"}, 0, false},
+		{"negative", []string{"cruid=-1"}, 0, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := getExplicitCruid(test.flags)
+			if ok != test.ok || got != test.want {
+				t.Fatalf("getExplicitCruid(%v) = (%d,%v), want (%d,%v)", test.flags, got, ok, test.want, test.ok)
+			}
+		})
+	}
+}
+
+func TestResolveCruid(t *testing.T) {
+	const client = "33333333-3333-3333-3333-333333333333"
+	tests := []struct {
+		name     string
+		flags    []string
+		identity string
+		want     uint32
+	}{
+		{"explicit override wins", []string{"cruid=1234"}, client, 1234},
+		{"derived when no override", nil, client, deriveCruid(client)},
+		{"empty identity yields legacy shared cache", nil, "", 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := resolveCruid(test.flags, test.identity); got != test.want {
+				t.Fatalf("resolveCruid(%v, %q) = %d, want %d", test.flags, test.identity, got, test.want)
+			}
+		})
+	}
+}
+
+func makeJWT(claims map[string]string) string {
+	payload, _ := json.Marshal(claims)
+	seg := func(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+	return seg([]byte(`{"alg":"none"}`)) + "." + seg(payload) + "." + seg([]byte("sig"))
+}
+
+func TestOAuthTokenSubject(t *testing.T) {
+	oid := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	tests := []struct {
+		name  string
+		token string
+		want  string
+	}{
+		{"prefers oid over sub", makeJWT(map[string]string{"oid": oid, "sub": "other"}), oid},
+		{"falls back to sub", makeJWT(map[string]string{"sub": "subonly"}), "subonly"},
+		{"malformed token", "not-a-jwt", ""},
+		{"non-base64 payload", "a.b.c", ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := oauthTokenSubject(test.token); got != test.want {
+				t.Fatalf("oauthTokenSubject(%q) = %q, want %q", test.token, got, test.want)
 			}
 		})
 	}

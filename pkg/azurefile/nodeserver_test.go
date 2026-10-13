@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -2572,7 +2573,10 @@ func TestSetCredentialCacheWithOAuthToken(t *testing.T) {
 				serverNameField: "testaccount.file.core.windows.net",
 			},
 			setupDriver: func(d *Driver) {
-				token := "test-oauth-token-value"
+				// A minimal JWT whose payload carries an oid, so oauthTokenSubject
+				// resolves a stable identity and the fail-closed path is not taken.
+				payload := base64.RawURLEncoding.EncodeToString([]byte(`{"oid":"test-oid-123"}`))
+				token := "hdr." + payload + ".sig"
 				secret := &corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{Name: "test-secret", Namespace: "default"},
 					Data: map[string][]byte{
@@ -2581,11 +2585,30 @@ func TestSetCredentialCacheWithOAuthToken(t *testing.T) {
 					},
 				}
 				d.kubeClient = fake.NewSimpleClientset(secret)
-				// pre-populate SHA cache
+				// pre-populate SHA cache keyed by server|cruid for this identity.
+				cruid := deriveCruid("test-oid-123")
 				tokenSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(token)))
-				d.oauthTokenSHAMap.Store("testaccount.file.core.windows.net", tokenSHA)
+				d.oauthTokenSHAMap.Store(fmt.Sprintf("testaccount.file.core.windows.net|%d", cruid), tokenSHA)
 			},
 			expectSkip: true,
+		},
+		{
+			desc: "fail closed when token is not a parseable JWT",
+			volumeContext: map[string]string{
+				secretNameField: "test-secret",
+				serverNameField: "testaccount.file.core.windows.net",
+			},
+			setupDriver: func(d *Driver) {
+				secret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-secret", Namespace: "default"},
+					Data: map[string][]byte{
+						defaultSecretAccountName: []byte("testaccount"),
+						defaultSecretOAuthToken:  []byte("not-a-jwt-token"),
+					},
+				}
+				d.kubeClient = fake.NewSimpleClientset(secret)
+			},
+			expectedErr: "unable to extract oid or sub from the OAuth token for server",
 		},
 	}
 
@@ -2595,7 +2618,7 @@ func TestSetCredentialCacheWithOAuthToken(t *testing.T) {
 			if test.setupDriver != nil {
 				test.setupDriver(d)
 			}
-			_, err := d.setCredentialCacheWithOAuthToken(context.Background(), "vol_1", test.volumeContext)
+			_, _, err := d.setCredentialCacheWithOAuthToken(context.Background(), "vol_1", test.volumeContext, nil)
 			if test.expectSkip {
 				assert.NoError(t, err)
 			} else if test.expectedErr != "" {

@@ -187,6 +187,8 @@ spec:
               mountPath: /etc/azfilesauth
             - name: log-dir
               mountPath: /var/log/
+            - name: host-etc
+              mountPath: /host/etc
           resources:
             limits:
               memory: 400Mi
