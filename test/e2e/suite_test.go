@@ -469,12 +469,20 @@ func setupWorkloadIdentity(ctx context.Context, cs clientset.Interface, azureCli
 	}
 	log.Printf("Discovered OIDC issuer URL: %s", oidcIssuerURL)
 
-	// Step 2: Get node identity info (single call to avoid nondeterministic map iteration)
-	identityInfo, err := azureClient.GetNodeIdentityInfo(ctx, creds.ResourceGroup)
-	if err != nil {
-		return "", fmt.Errorf("failed to get node identity: %v", err)
+	// Step 2: Get identity info. By default the node's kubelet identity is reused, which
+	// requires write access to its resource group. When WI_CREATE_IDENTITY=true (managed
+	// AKS harness), a dedicated identity is created in the cluster resource group instead.
+	var identityInfo *azure.NodeIdentityInfo
+	var err2 error
+	if os.Getenv("WI_CREATE_IDENTITY") == "true" {
+		identityInfo, err2 = azureClient.EnsureUserAssignedIdentity(ctx, creds.ResourceGroup, "azurefile-e2e-wi", creds.Location)
+	} else {
+		identityInfo, err2 = azureClient.GetNodeIdentityInfo(ctx, creds.ResourceGroup)
 	}
-	log.Printf("Node identity clientID: %s, principalID: %s", identityInfo.ClientID, identityInfo.PrincipalID)
+	if err2 != nil {
+		return "", fmt.Errorf("failed to get workload identity: %v", err2)
+	}
+	log.Printf("Workload identity clientID: %s, principalID: %s", identityInfo.ClientID, identityInfo.PrincipalID)
 
 	// Parse identity name and resource group from resource ID
 	// Format: /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<name>
@@ -543,7 +551,16 @@ func setupWorkloadIdentity(ctx context.Context, cs clientset.Interface, azureCli
 	}
 	log.Printf("Assigned Storage Account Contributor role to identity")
 
-	// Step 6: Verify OIDC JWKS endpoint is accessible
+	// Steps 6-7: Verify OIDC discovery/JWKS. WI_OIDC_VIA_APISERVER=true reads them
+	// through the kube-apiserver instead of the public issuer URL, which test
+	// clusters do not expose to the e2e pod (and skips the CAPZ key-mismatch repair).
+	if os.Getenv("WI_OIDC_VIA_APISERVER") == "true" {
+		if err := waitForOIDCViaAPIServer(ctx, cs, 5*time.Minute); err != nil {
+			return "", fmt.Errorf("OIDC discovery not ready via apiserver: %v", err)
+		}
+		return identityInfo.ClientID, nil
+	}
+
 	if err := waitForOIDCJWKS(oidcIssuerURL, 5*time.Minute); err != nil {
 		return "", fmt.Errorf("OIDC JWKS not ready: %v", err)
 	}
@@ -1121,4 +1138,25 @@ func waitForPodComplete(ctx context.Context, cs clientset.Interface, namespace, 
 
 		time.Sleep(3 * time.Second)
 	}
+}
+
+// waitForOIDCViaAPIServer polls the kube-apiserver's discovery and JWKS non-resource URLs.
+func waitForOIDCViaAPIServer(ctx context.Context, cs clientset.Interface, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastErr = nil
+		for _, path := range []string{"/.well-known/openid-configuration", "/openid/v1/jwks"} {
+			if _, err := cs.Discovery().RESTClient().Get().AbsPath(path).DoRaw(ctx); err != nil {
+				lastErr = fmt.Errorf("GET %s: %v", path, err)
+				break
+			}
+		}
+		if lastErr == nil {
+			return nil
+		}
+		log.Printf("OIDC not ready: %v, retrying...", lastErr)
+		time.Sleep(10 * time.Second)
+	}
+	return lastErr
 }
