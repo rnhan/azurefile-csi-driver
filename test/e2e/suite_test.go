@@ -467,6 +467,39 @@ const (
 func setupWorkloadIdentity(ctx context.Context, cs clientset.Interface, azureClient *azure.Client, creds *credentials.Credentials) (string, error) {
 	log.Println("Setting up workload identity for e2e tests...")
 
+	// WI_PREPROVISIONED_CLIENT_ID: the harness already created the UAMI, its
+	// federated credential and the role assignments; only the in-cluster
+	// ServiceAccount is created here.
+	if preClientID := os.Getenv("WI_PREPROVISIONED_CLIENT_ID"); preClientID != "" {
+		log.Printf("Using pre-provisioned workload identity clientID %s (skipping UAMI/FIC/role setup)", preClientID)
+		sa := &corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      wiServiceAccountName,
+				Namespace: wiServiceAccountNamespace,
+				Labels:    map[string]string{"azure.workload.identity/use": "true"},
+				Annotations: map[string]string{
+					"azure.workload.identity/client-id": preClientID,
+					"azure.workload.identity/tenant-id": creds.TenantID,
+				},
+			},
+		}
+		if _, err := cs.CoreV1().ServiceAccounts(wiServiceAccountNamespace).Create(ctx, sa, metav1.CreateOptions{}); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return "", fmt.Errorf("failed to create service account: %v", err)
+			}
+			existing, getErr := cs.CoreV1().ServiceAccounts(wiServiceAccountNamespace).Get(ctx, wiServiceAccountName, metav1.GetOptions{})
+			if getErr != nil {
+				return "", fmt.Errorf("failed to get existing service account: %v", getErr)
+			}
+			existing.Labels = sa.Labels
+			existing.Annotations = sa.Annotations
+			if _, err = cs.CoreV1().ServiceAccounts(wiServiceAccountNamespace).Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
+				return "", fmt.Errorf("failed to update service account: %v", err)
+			}
+		}
+		return preClientID, nil
+	}
+
 	// Step 1: Discover OIDC issuer URL from kube-apiserver
 	oidcIssuerURL, err := discoverOIDCIssuer(ctx, cs)
 	if err != nil {
