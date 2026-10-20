@@ -877,6 +877,17 @@ func uploadOIDCConfigToBlob(blobServiceURL string, configBody []byte, creds *cre
 func waitForAADTokenExchange(ctx context.Context, cs clientset.Interface, clientID string, creds *credentials.Credentials, timeout time.Duration) error {
 	log.Printf("Waiting up to %v for AAD to accept token exchange for client %s", timeout, clientID)
 
+	// Exchanging seconds after FIC creation returned AADSTS70025 then a persistent
+	// AADSTS501661 on some clusters; give AAD time to propagate the FIC and fetch the issuer.
+	initialDelay := 90 * time.Second
+	if v := os.Getenv("WI_AAD_INITIAL_DELAY"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			initialDelay = d
+		}
+	}
+	log.Printf("Delaying first AAD token exchange by %v", initialDelay)
+	time.Sleep(initialDelay)
+
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 	deadline := time.Now().Add(timeout)
 	var lastErr error
