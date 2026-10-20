@@ -158,6 +158,11 @@ var _ = ginkgo.BeforeSuite(func(ctx ginkgo.SpecContext) {
 								log.Printf("WARNING: %v", errWISetup)
 								return
 							}
+							go diagnoseWIToken(context.Background(), bgCS, creds)
+							if os.Getenv("WI_SKIP_AAD_WARMUP") == "true" {
+								log.Printf("WI_SKIP_AAD_WARMUP=true: not warming AAD; the WI specs will exercise the driver mount directly")
+								return
+							}
 							if warmErr := waitForAADTokenExchange(context.Background(), bgCS, wiClientID, creds, 45*time.Minute); warmErr != nil {
 								errWISetup = fmt.Errorf("AAD token exchange not ready: %v", warmErr)
 								log.Printf("WARNING: WI background warm-up failed: %v", errWISetup)
@@ -891,6 +896,12 @@ func waitForAADTokenExchange(ctx context.Context, cs clientset.Interface, client
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 	deadline := time.Now().Add(timeout)
 	var lastErr error
+	pollInterval := 15 * time.Second
+	if v := os.Getenv("WI_AAD_POLL_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			pollInterval = d
+		}
+	}
 
 	for time.Now().Before(deadline) {
 		tokenReq := &authv1.TokenRequest{
@@ -904,7 +915,7 @@ func waitForAADTokenExchange(ctx context.Context, cs clientset.Interface, client
 		if err != nil {
 			lastErr = fmt.Errorf("creating SA token: %v", err)
 			log.Printf("Token exchange check: %v, retrying...", lastErr)
-			time.Sleep(15 * time.Second)
+			time.Sleep(pollInterval)
 			continue
 		}
 
@@ -941,7 +952,7 @@ func waitForAADTokenExchange(ctx context.Context, cs clientset.Interface, client
 		if err != nil {
 			lastErr = fmt.Errorf("AAD token request: %v", err)
 			log.Printf("Token exchange check: %v, retrying...", lastErr)
-			time.Sleep(15 * time.Second)
+			time.Sleep(pollInterval)
 			continue
 		}
 		body, _ := io.ReadAll(resp.Body)
@@ -956,15 +967,63 @@ func waitForAADTokenExchange(ctx context.Context, cs clientset.Interface, client
 		if strings.Contains(bodyStr, "AADSTS7000272") {
 			lastErr = fmt.Errorf("AAD returned AADSTS7000272")
 			log.Printf("Token exchange check: AADSTS7000272, retrying in 15s...")
-			time.Sleep(15 * time.Second)
+			time.Sleep(pollInterval)
 			continue
 		}
 
 		lastErr = fmt.Errorf("AAD returned status %d: %s", resp.StatusCode, bodyStr)
 		log.Printf("Token exchange check: %v, retrying...", lastErr)
-		time.Sleep(15 * time.Second)
+		time.Sleep(pollInterval)
 	}
 	return fmt.Errorf("timed out waiting for AAD token exchange: %v", lastErr)
+}
+
+// diagnoseWIToken logs the claims of a freshly minted service-account token and
+// whether the token's issuer discovery document is reachable from the pod, to
+// compare against what AAD reports (AADSTS50166 "External OIDC endpoint failed").
+func diagnoseWIToken(ctx context.Context, cs clientset.Interface, creds *credentials.Credentials) {
+	time.Sleep(20 * time.Second)
+	tokenResp, err := cs.CoreV1().ServiceAccounts(wiServiceAccountNamespace).CreateToken(ctx, wiServiceAccountName,
+		&authv1.TokenRequest{Spec: authv1.TokenRequestSpec{Audiences: []string{"api://AzureADTokenExchange"}, ExpirationSeconds: int64Ptr(600)}}, metav1.CreateOptions{})
+	if err != nil {
+		log.Printf("WI-DIAG: creating SA token: %v", err)
+		return
+	}
+	parts := strings.Split(tokenResp.Status.Token, ".")
+	if len(parts) != 3 {
+		log.Printf("WI-DIAG: unexpected token format")
+		return
+	}
+	for i, name := range []string{"header", "claims"} {
+		raw, err := base64.RawURLEncoding.DecodeString(parts[i])
+		if err != nil {
+			log.Printf("WI-DIAG: decoding %s: %v", name, err)
+			continue
+		}
+		log.Printf("WI-DIAG: token %s: %s", name, raw)
+		if name != "claims" {
+			continue
+		}
+		var c struct {
+			Iss string `json:"iss"`
+		}
+		if json.Unmarshal(raw, &c) != nil || c.Iss == "" {
+			continue
+		}
+		hc := &http.Client{Timeout: 15 * time.Second}
+		for _, suffix := range []string{"/.well-known/openid-configuration", "/openid/v1/jwks"} {
+			u := strings.TrimSuffix(c.Iss, "/") + suffix
+			resp, err := hc.Get(u) //nolint:noctx
+			if err != nil {
+				log.Printf("WI-DIAG: GET %s from pod: %v", u, err)
+				continue
+			}
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+			resp.Body.Close()
+			log.Printf("WI-DIAG: GET %s from pod: status=%d body=%s", u, resp.StatusCode, b)
+		}
+	}
+	log.Printf("WI-DIAG: tenant=%s authority=%q", creds.TenantID, os.Getenv("AZURE_AUTHORITY_HOST"))
 }
 
 func int64Ptr(i int64) *int64 { return &i }
