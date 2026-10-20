@@ -159,8 +159,8 @@ var _ = ginkgo.BeforeSuite(func(ctx ginkgo.SpecContext) {
 								return
 							}
 							go diagnoseWIToken(context.Background(), bgCS, creds)
-							if os.Getenv("WI_SKIP_AAD_WARMUP") == "true" {
-								log.Printf("WI_SKIP_AAD_WARMUP=true: not warming AAD; the WI specs will exercise the driver mount directly")
+							if os.Getenv("WI_AAD_WARMUP") != "true" {
+								log.Printf("AAD warm-up disabled (set WI_AAD_WARMUP=true to enable); the WI specs will exercise the driver mount directly")
 								return
 							}
 							if warmErr := waitForAADTokenExchange(context.Background(), bgCS, wiClientID, creds, 45*time.Minute); warmErr != nil {
@@ -1263,3 +1263,45 @@ func waitForOIDCViaAPIServer(ctx context.Context, cs clientset.Interface, timeou
 	}
 	return lastErr
 }
+
+// On a failed workload-identity spec, dump default-namespace events and the
+// CSI node driver logs so the driver-side mount error is visible in CI output.
+var _ = ginkgo.ReportAfterEach(func(report ginkgo.SpecReport) {
+	if !report.Failed() || !strings.Contains(report.FullText(), "workload identity") {
+		return
+	}
+	kubeConfig, err := framework.LoadConfig()
+	if err != nil {
+		return
+	}
+	cs, err := clientset.NewForConfig(kubeConfig)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	log.Printf("WI-FAILDIAG: spec %q failed; dumping events and node driver logs", report.LeafNodeText)
+	if evs, err := cs.CoreV1().Events("default").List(ctx, metav1.ListOptions{}); err == nil {
+		for _, e := range evs.Items {
+			if e.Type == corev1.EventTypeWarning {
+				log.Printf("WI-FAILDIAG: event %s/%s %s: %s", e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Reason, e.Message)
+			}
+		}
+	}
+	pods, err := cs.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return
+	}
+	tail := int64(120)
+	for _, p := range pods.Items {
+		if !strings.HasPrefix(p.Name, "csi-azurefile-node") || strings.Contains(p.Name, "win") {
+			continue
+		}
+		raw, err := cs.CoreV1().Pods("kube-system").GetLogs(p.Name, &corev1.PodLogOptions{Container: "azurefile", TailLines: &tail}).DoRaw(ctx)
+		if err != nil {
+			log.Printf("WI-FAILDIAG: logs of %s: %v", p.Name, err)
+			continue
+		}
+		log.Printf("WI-FAILDIAG: node %s (pod %s) driver log tail:\n%s", p.Spec.NodeName, p.Name, string(raw))
+	}
+})
