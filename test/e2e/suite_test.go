@@ -73,6 +73,10 @@ var (
 	isTestingMigration             = os.Getenv(testMigrationEnvVar) != ""
 	isWindowsCluster               = os.Getenv(testWindowsEnvVar) != ""
 	isCapzTest                     = os.Getenv("NODE_MACHINE_TYPE") != ""
+	skipDriverInstall              = os.Getenv("SKIP_DRIVER_INSTALL") != ""
+	wiCreateIdentity               = os.Getenv("WI_CREATE_IDENTITY") != ""
+	wiOIDCViaAPIServer             = os.Getenv("WI_OIDC_VIA_APISERVER") != ""
+	wiSkipAADWarmup                = os.Getenv("WI_SKIP_AAD_WARMUP") != ""
 	winServerVer                   = os.Getenv(testWinServerVerEnvVar)
 	bringKeyStorageClassParameters = map[string]string{
 		"csi.storage.k8s.io/provisioner-secret-namespace": "default",
@@ -120,7 +124,7 @@ var _ = ginkgo.BeforeSuite(func(ctx ginkgo.SpecContext) {
 	if isTestingMigration || !isUsingInTreeVolumePlugin {
 		creds, err := credentials.CreateAzureCredentialFile(false)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		azureClient, err := azure.GetAzureClient(creds.Cloud, creds.SubscriptionID, creds.AADClientID, creds.TenantID, creds.AADClientSecret, creds.AADFederatedTokenFile)
+		azureClient, err := azure.GetAzureClient(creds.Cloud, creds.SubscriptionID, creds.AADClientID, creds.TenantID, creds.AADClientSecret, creds.AADFederatedTokenFile, creds.UseManagedIdentity)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		suiteCreds = creds
 		suiteAzureClient = azureClient
@@ -151,6 +155,10 @@ var _ = ginkgo.BeforeSuite(func(ctx ginkgo.SpecContext) {
 						// Start background AAD OIDC cache warm-up
 						go func() {
 							defer close(wiReady)
+							if wiSkipAADWarmup {
+								log.Printf("Skipping AAD token exchange warm-up (WI_SKIP_AAD_WARMUP)")
+								return
+							}
 							bgCS, csErr := clientset.NewForConfig(kubeConfig)
 							if csErr != nil {
 								errWISetup = fmt.Errorf("failed to create kube client for WI warm-up: %v", csErr)
@@ -199,31 +207,35 @@ var _ = ginkgo.BeforeSuite(func(ctx ginkgo.SpecContext) {
 			}
 		}
 
-		// Install Azure File CSI Driver on cluster from project root
-		e2eBootstrap := testCmd{
-			command:  "make",
-			args:     []string{"e2e-bootstrap"},
-			startLog: "Installing Azure File CSI Driver...",
-			endLog:   "Azure File CSI Driver installed",
-		}
-
-		createMetricsSVC := testCmd{
-			command:  "make",
-			args:     []string{"create-metrics-svc"},
-			startLog: "create metrics service ...",
-			endLog:   "metrics service created",
-		}
-		execTestCmd([]testCmd{e2eBootstrap, createMetricsSVC})
-
-		if !isTestingMigration {
-			// Install SMB provisioner on cluster
-			installSMBProvisioner := testCmd{
+		// Install Azure File CSI Driver on cluster from project root.
+		// SKIP_DRIVER_INSTALL lets an external harness run the suite against a
+		// pre-deployed driver.
+		if !skipDriverInstall {
+			e2eBootstrap := testCmd{
 				command:  "make",
-				args:     []string{"install-smb-provisioner"},
-				startLog: "Installing SMB provisioner...",
-				endLog:   "SMB provisioner installed",
+				args:     []string{"e2e-bootstrap"},
+				startLog: "Installing Azure File CSI Driver...",
+				endLog:   "Azure File CSI Driver installed",
 			}
-			execTestCmd([]testCmd{installSMBProvisioner})
+
+			createMetricsSVC := testCmd{
+				command:  "make",
+				args:     []string{"create-metrics-svc"},
+				startLog: "create metrics service ...",
+				endLog:   "metrics service created",
+			}
+			execTestCmd([]testCmd{e2eBootstrap, createMetricsSVC})
+
+			if !isTestingMigration {
+				// Install SMB provisioner on cluster
+				installSMBProvisioner := testCmd{
+					command:  "make",
+					args:     []string{"install-smb-provisioner"},
+					startLog: "Installing SMB provisioner...",
+					endLog:   "SMB provisioner installed",
+				}
+				execTestCmd([]testCmd{installSMBProvisioner})
+			}
 		}
 
 		kubeconfig := os.Getenv(kubeconfigEnvVar)
@@ -256,62 +268,66 @@ var _ = ginkgo.AfterSuite(func(ctx ginkgo.SpecContext) {
 		execTestCmd([]testCmd{cmLog})
 	}
 	if isTestingMigration || !isUsingInTreeVolumePlugin {
-		checkPodsRestart := testCmd{
-			command:  "bash",
-			args:     []string{"test/utils/check_driver_pods_restart.sh", "log"},
-			startLog: "Check driver pods if restarts ...",
-			endLog:   "Check successfully",
-		}
-		execTestCmd([]testCmd{checkPodsRestart})
-
-		os := "linux"
-		if isWindowsCluster {
-			os = "windows"
-			if winServerVer == "windows-2022" {
-				os = winServerVer
-			}
-		}
-		createExampleDeployment := testCmd{
-			command:  "bash",
-			args:     []string{"hack/verify-examples.sh", os},
-			startLog: "create example deployments",
-			endLog:   "example deployments created",
-		}
-		execTestCmd([]testCmd{createExampleDeployment})
-
-		azurefileLog := testCmd{
-			command:     "bash",
-			args:        []string{"test/utils/azurefile_log.sh"},
-			startLog:    "===================azurefile log===================",
-			endLog:      "===================================================",
-			ignoreError: true,
-		}
-		e2eTeardown := testCmd{
-			command:  "make",
-			args:     []string{"e2e-teardown"},
-			startLog: "Uninstalling Azure File CSI Driver...",
-			endLog:   "Azure File CSI Driver uninstalled",
-		}
-		execTestCmd([]testCmd{azurefileLog, e2eTeardown})
-
-		if !isTestingMigration {
-			// install CSI Driver deployment scripts test
-			installDriver := testCmd{
+		// When SKIP_DRIVER_INSTALL is set the suite did not install the driver,
+		// so skip steps that assume a suite-managed source install.
+		if !skipDriverInstall {
+			checkPodsRestart := testCmd{
 				command:  "bash",
-				args:     []string{"deploy/install-driver.sh", "master", "windows,local"},
-				startLog: "===================install CSI Driver deployment scripts test===================",
-				endLog:   "===================================================",
+				args:     []string{"test/utils/check_driver_pods_restart.sh", "log"},
+				startLog: "Check driver pods if restarts ...",
+				endLog:   "Check successfully",
 			}
+			execTestCmd([]testCmd{checkPodsRestart})
 
+			os := "linux"
+			if isWindowsCluster {
+				os = "windows"
+				if winServerVer == "windows-2022" {
+					os = winServerVer
+				}
+			}
 			createExampleDeployment := testCmd{
 				command:  "bash",
 				args:     []string{"hack/verify-examples.sh", os},
-				startLog: "create example deployments#2",
-				endLog:   "example deployments#2 created",
+				startLog: "create example deployments",
+				endLog:   "example deployments created",
 			}
 			execTestCmd([]testCmd{createExampleDeployment})
 
-			execTestCmd([]testCmd{installDriver})
+			azurefileLog := testCmd{
+				command:     "bash",
+				args:        []string{"test/utils/azurefile_log.sh"},
+				startLog:    "===================azurefile log===================",
+				endLog:      "===================================================",
+				ignoreError: true,
+			}
+			e2eTeardown := testCmd{
+				command:  "make",
+				args:     []string{"e2e-teardown"},
+				startLog: "Uninstalling Azure File CSI Driver...",
+				endLog:   "Azure File CSI Driver uninstalled",
+			}
+			execTestCmd([]testCmd{azurefileLog, e2eTeardown})
+
+			if !isTestingMigration {
+				// install CSI Driver deployment scripts test
+				installDriver := testCmd{
+					command:  "bash",
+					args:     []string{"deploy/install-driver.sh", "master", "windows,local"},
+					startLog: "===================install CSI Driver deployment scripts test===================",
+					endLog:   "===================================================",
+				}
+
+				createExampleDeployment := testCmd{
+					command:  "bash",
+					args:     []string{"hack/verify-examples.sh", os},
+					startLog: "create example deployments#2",
+					endLog:   "example deployments#2 created",
+				}
+				execTestCmd([]testCmd{createExampleDeployment})
+
+				execTestCmd([]testCmd{installDriver})
+			}
 		}
 
 		checkAccountCreationLeak(ctx)
@@ -372,7 +388,7 @@ func execTestCmd(cmds []testCmd) {
 func checkAccountCreationLeak(_ context.Context) {
 	creds, err := credentials.CreateAzureCredentialFile(false)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
-	azureClient, err := azure.GetAzureClient(creds.Cloud, creds.SubscriptionID, creds.AADClientID, creds.TenantID, creds.AADClientSecret, creds.AADFederatedTokenFile)
+	azureClient, err := azure.GetAzureClient(creds.Cloud, creds.SubscriptionID, creds.AADClientID, creds.TenantID, creds.AADClientSecret, creds.AADFederatedTokenFile, creds.UseManagedIdentity)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	accountNum, err := azureClient.GetAccountNumByResourceGroup(context.Background(), creds.ResourceGroup)
@@ -440,6 +456,7 @@ const (
 	wiServiceAccountName        = "azurefile-wi-test-sa"
 	wiServiceAccountNamespace   = "default"
 	wiFederatedCredentialName   = "azurefile-e2e-wi-fic"
+	wiIdentityName              = "azurefile-e2e-wi"
 	wiStorageFileDataSMBMIAdmin = "a235d3ee-5935-4cfb-8cc5-a3303ad5995e" // Storage File Data SMB MI Admin role GUID
 	wiStorageAccountContributor = "17d1049b-9a84-46fb-8f53-869881c3d3ab" // Storage Account Contributor role GUID
 )
@@ -460,12 +477,18 @@ func setupWorkloadIdentity(ctx context.Context, cs clientset.Interface, azureCli
 	}
 	log.Printf("Discovered OIDC issuer URL: %s", oidcIssuerURL)
 
-	// Step 2: Get node identity info (single call to avoid nondeterministic map iteration)
-	identityInfo, err := azureClient.GetNodeIdentityInfo(ctx, creds.ResourceGroup)
-	if err != nil {
-		return "", fmt.Errorf("failed to get node identity: %v", err)
+	// Step 2: Get node identity info (single call to avoid nondeterministic map iteration),
+	// or create a dedicated identity when the node identity's resource group is not writable.
+	var identityInfo *azure.NodeIdentityInfo
+	if wiCreateIdentity {
+		identityInfo, err = azureClient.EnsureUserAssignedIdentity(ctx, creds.ResourceGroup, wiIdentityName, creds.Location)
+	} else {
+		identityInfo, err = azureClient.GetNodeIdentityInfo(ctx, creds.ResourceGroup)
 	}
-	log.Printf("Node identity clientID: %s, principalID: %s", identityInfo.ClientID, identityInfo.PrincipalID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get workload identity: %v", err)
+	}
+	log.Printf("Workload identity clientID: %s, principalID: %s", identityInfo.ClientID, identityInfo.PrincipalID)
 
 	// Parse identity name and resource group from resource ID
 	// Format: /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<name>
@@ -534,6 +557,13 @@ func setupWorkloadIdentity(ctx context.Context, cs clientset.Interface, azureCli
 	}
 	log.Printf("Assigned Storage Account Contributor role to identity")
 
+	if wiOIDCViaAPIServer {
+		if err := waitForOIDCViaAPIServer(ctx, cs, 5*time.Minute); err != nil {
+			return "", fmt.Errorf("OIDC discovery not ready via kube-apiserver: %v", err)
+		}
+		return identityInfo.ClientID, nil
+	}
+
 	// Step 6: Verify OIDC JWKS endpoint is accessible
 	if err := waitForOIDCJWKS(oidcIssuerURL, 5*time.Minute); err != nil {
 		return "", fmt.Errorf("OIDC JWKS not ready: %v", err)
@@ -566,6 +596,28 @@ func discoverOIDCIssuer(ctx context.Context, cs clientset.Interface) (string, er
 		return "", fmt.Errorf("OIDC issuer URL is empty in cluster configuration")
 	}
 	return oidcConfig.Issuer, nil
+}
+
+// waitForOIDCViaAPIServer polls the kube-apiserver's OIDC discovery and JWKS
+// endpoints, for clusters whose issuer URL is not reachable from the test pod.
+func waitForOIDCViaAPIServer(ctx context.Context, cs clientset.Interface, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastErr = nil
+		for _, path := range []string{"/.well-known/openid-configuration", "/openid/v1/jwks"} {
+			if _, err := cs.Discovery().RESTClient().Get().AbsPath(path).DoRaw(ctx); err != nil {
+				lastErr = fmt.Errorf("GET %s: %v", path, err)
+				break
+			}
+		}
+		if lastErr == nil {
+			return nil
+		}
+		log.Printf("OIDC discovery not ready: %v, retrying...", lastErr)
+		time.Sleep(10 * time.Second)
+	}
+	return lastErr
 }
 
 // waitForOIDCJWKS polls the OIDC issuer's JWKS endpoint until it returns a

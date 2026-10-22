@@ -1949,7 +1949,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a volume on demand with workload identity token mount [file.csi.azure.com]", ginkgo.Serial, func(ctx ginkgo.SpecContext) {
+	ginkgo.It("should create a volume on demand with workload identity token mount [file.csi.azure.com]", ginkgo.Serial, ginkgo.Label("wi-kerberos"), func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 		skipIfTestingInMigrationCluster()
@@ -1996,7 +1996,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		test.Run(ctx, cs, defaultNS)
 	})
 
-	ginkgo.It("should create a volume on demand with workload identity account key retrieval [file.csi.azure.com]", ginkgo.Serial, func(ctx ginkgo.SpecContext) {
+	ginkgo.It("should create a volume on demand with workload identity account key retrieval [file.csi.azure.com]", ginkgo.Serial, ginkgo.Label("wi-account-key"), func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 		skipIfTestingInMigrationCluster()
